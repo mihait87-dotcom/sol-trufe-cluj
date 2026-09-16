@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Sol Cluj – GPS & indice trufe</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+html,body,#map{height:100%;margin:0}
+body{font-family:Arial,sans-serif;background:#111}
+#map{height:100vh}
+#panel{
+ position:fixed;z-index:1000;left:10px;right:10px;top:10px;
+ background:rgba(255,255,255,.96);border-radius:14px;padding:12px;
+ box-shadow:0 3px 18px rgba(0,0,0,.25)
+}
+.title{font-size:18px;font-weight:700}
+.value{font-size:30px;font-weight:800;margin-top:3px}
+.small{font-size:13px;color:#555;line-height:1.35}
+#status{margin-top:5px}
+button{border:0;border-radius:10px;padding:10px 12px;font-weight:700;margin-top:8px}
+#gps{background:#1f6feb;color:white}
+#loc{background:#eee}
+.legend{margin-top:7px}
+.leaflet-control-attribution{font-size:10px}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <div class="title">Sol la poziția mea</div>
+  <div class="value" id="score">—</div>
+  <div id="soil" class="small">Aștept poziția GPS…</div>
+  <div id="status" class="small">Harta folosește SIGSTAR-200, sursa GIS de soluri la scara 1:200.000.</div>
+  <button id="gps">PORNEȘTE GPS</button>
+  <button id="loc">CENTREAZĂ PE POZIȚIA MEA</button>
+  <div class="legend small">
+    Indicele este <b>orientativ</b>: exprimă favorabilitatea solului pentru habitatul trufier, nu probabilitatea reală de a găsi trufe.
+    Gazda arborelui, calcarul, pH-ul, drenajul și microclimatul trebuie verificate separat.
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const WMS = "https://sigstar-200.icpa.ro/wms";
+const map = L.map("map").setView([46.77,23.59], 11);
+
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19, attribution: "&copy; OpenStreetMap"
+}).addTo(map);
+
+let soilLayer = null;
+let gpsMarker = null;
+let accuracyCircle = null;
+let watchId = null;
+let lastLatLng = null;
+let currentLayerName = null;
+
+function setStatus(t){document.getElementById("status").textContent=t;}
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));}
+
+function scoreSoil(text){
+  const s=(text||"").toLowerCase();
+  // Heuristic soil-habitat index only; not a truffle occurrence probability.
+  if(/rendzin|rendzina|calcaric|calcareous/.test(s)) return 95;
+  if(/chernozem/.test(s)) return 90;
+  if(/phaeozem|cernoziom/.test(s)) return 88;
+  if(/regosol|regosol/.test(s)) return 82;
+  if(/eutric cambisol|cambisol eutric/.test(s)) return 70;
+  if(/luvisol|luvisol/.test(s)) return 62;
+  if(/fluvisol|alluvial/.test(s)) return 55;
+  if(/vertisol/.test(s)) return 50;
+  if(/podzol/.test(s)) return 30;
+  if(/gleysol|stagnosol|gleic|stagnic|sol gleic/.test(s)) return 30;
+  return 50;
+}
+
+function chooseLayer(xml){
+  const doc=new DOMParser().parseFromString(xml,"text/xml");
+  const layers=[...doc.getElementsByTagName("Layer")];
+  // Prefer a queryable named layer with soil/SIGSTAR in title/name.
+  let candidates=layers.filter(x=>x.querySelector(":scope > Name"));
+  candidates.sort((a,b)=>{
+    const aa=((a.querySelector(":scope > Name")?.textContent||"")+" "+(a.querySelector(":scope > Title")?.textContent||"")).toLowerCase();
+    const bb=((b.querySelector(":scope > Name")?.textContent||"")+" "+(b.querySelector(":scope > Title")?.textContent||"")).toLowerCase();
+    const wa=/(soil|sol|sigstar|smu)/.test(aa)?0:1;
+    const wb=/(soil|sol|sigstar|smu)/.test(bb)?0:1;
+    return wa-wb;
+  });
+  return candidates[0]?.querySelector(":scope > Name")?.textContent || null;
+}
+
+async function initWMS(){
+  try{
+    const r=await fetch(WMS+"?service=WMS&request=GetCapabilities&version=1.3.0");
+    const xml=await r.text();
+    currentLayerName=chooseLayer(xml);
+    if(!currentLayerName) throw new Error("Nu am găsit un layer WMS.");
+    soilLayer=L.tileLayer.wms(WMS,{
+      layers:currentLayerName,format:"image/png",transparent:true,
+      version:"1.3.0",opacity:.62
+    }).addTo(map);
+    setStatus("SIGSTAR-200 activ. Layer: "+currentLayerName);
+  }catch(e){
+    // The map remains usable even if the service blocks browser requests.
+    setStatus("Layerul SIGSTAR-200 nu a putut fi inițializat automat. Verifică accesul la serviciul ICPA.");
+  }
+}
+initWMS();
+
+function getFeatureInfo(latlng){
+  if(!currentLayerName) return;
+  const size=map.getSize(), bounds=map.getBounds();
+  const sw=bounds.getSouthWest(), ne=bounds.getNorthEast();
+  const p=map.latLngToContainerPoint(latlng);
+  const x=Math.round(p.x), y=Math.round(p.y);
+
+  const params=new URLSearchParams({
+    service:"WMS",request:"GetFeatureInfo",version:"1.3.0",
+    layers:currentLayerName,query_layers:currentLayerName,
+    styles:"",crs:"EPSG:4326",
+    bbox:`${sw.lat},${sw.lng},${ne.lat},${ne.lng}`,
+    width:size.x,height:size.y,i:x,j:y,
+    info_format:"application/json",feature_count:"5"
+  });
+
+  fetch(WMS+"?"+params.toString())
+   .then(r=>r.text())
+   .then(t=>{
+     let obj=null; try{obj=JSON.parse(t)}catch(e){}
+     let raw="";
+     if(obj) raw=JSON.stringify(obj);
+     else raw=t.replace(/<[^>]+>/g," ").replace(/\s+/g," ");
+     if(!raw || /serviceexception|exception/i.test(raw)){
+       throw new Error("GetFeatureInfo indisponibil");
+     }
+     const sc=scoreSoil(raw);
+     document.getElementById("score").textContent=sc+"%";
+     document.getElementById("soil").innerHTML="Sol / poligon: "+esc(raw.slice(0,500));
+     setStatus("Identificare făcută în poligonul SIGSTAR-200.");
+   })
+   .catch(()=>{
+     setStatus("GPS funcționează, dar serviciul nu a returnat atributele poligonului prin GetFeatureInfo.");
+   });
+}
+
+function updatePosition(pos){
+  const {latitude,longitude,accuracy}=pos.coords;
+  lastLatLng=L.latLng(latitude,longitude);
+  if(!gpsMarker){
+    gpsMarker=L.circleMarker(lastLatLng,{radius:8,weight:3,fillOpacity:.9}).addTo(map);
+    accuracyCircle=L.circle(lastLatLng,{radius:accuracy,weight:1,fillOpacity:.05}).addTo(map);
+  }else{
+    gpsMarker.setLatLng(lastLatLng);
+    accuracyCircle.setLatLng(lastLatLng).setRadius(accuracy);
+  }
+  map.setView(lastLatLng, Math.max(map.getZoom(),14), {animate:true});
+  getFeatureInfo(lastLatLng);
+  setStatus("GPS: ±"+Math.round(accuracy)+" m. Se caută poligonul de sol…");
+}
+
+document.getElementById("gps").onclick=()=>{
+  if(!navigator.geolocation){
+    setStatus("Telefonul/browserul nu oferă geolocație.");
+    return;
+  }
+  if(watchId!==null) navigator.geolocation.clearWatch(watchId);
+  watchId=navigator.geolocation.watchPosition(updatePosition, e=>{
+    setStatus("Nu am putut citi GPS-ul: "+e.message);
+  },{enableHighAccuracy:true,maximumAge:5000,timeout:20000});
+};
+
+document.getElementById("loc").onclick=()=>{
+  if(lastLatLng) map.setView(lastLatLng,16,{animate:true});
+};
+
+map.on("moveend",()=>{
+  if(lastLatLng) getFeatureInfo(lastLatLng);
+});
+</script>
+</body>
+</html>
